@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ffmpeg::{AVPixelFormat, av_image_fill_pointers};
 use ffmpeg_sys_next as ffmpeg;
 use std::ffi::{CStr, CString};
 
@@ -153,6 +154,19 @@ impl AVFrame {
             return Err(averror("av_frame_make", retval));
         }
         Ok(())
+    }
+
+    pub fn rgb0_from_slice(&mut self, data: &[u8], bytes_per_line: i32) {
+        unsafe {
+            let frame_ptr = &mut *self.as_mut_ptr();
+            frame_ptr.linesize[0] = bytes_per_line;
+            frame_ptr.linesize[1] = 0;
+            frame_ptr.linesize[2] = 0;
+            frame_ptr.data[0] = data.as_ptr() as *mut u8;
+            frame_ptr.data[1] = 0 as *mut u8;
+            frame_ptr.data[2] = 0 as *mut u8;
+            //av_image_fill_pointers(frame_ptr.data.as_mut_ptr(), AVPixelFormat::AV_PIX_FMT_RGB0, frame_ptr.height, data.as_ptr() as *mut u8, (*self.ptr).linesize.as_ptr());
+        }
     }
 
     pub fn plane(&mut self, indx: usize, len: usize) -> &mut [u8] {

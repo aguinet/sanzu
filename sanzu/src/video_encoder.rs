@@ -3,8 +3,8 @@ use crate::yuv_rgb_rs;
 use anyhow::{Context, Result};
 use ffmpeg::AVPixelFormat;
 use ffmpeg_sys_next as ffmpeg;
+use x509_parser::nom::bytes;
 use std::{
-    cmp::Ordering,
     collections::HashMap,
     process,
     ptr::null_mut,
@@ -111,6 +111,13 @@ impl EncoderBuilder {
             (*frame_ptr).width = (*context_ptr).width;
             (*frame_ptr).height = (*context_ptr).height;
         }
+        let frame_view = AVFrame::new()?;
+        let frame_ptr_view = frame_view.as_mut_ptr();
+        unsafe {
+            (*frame_ptr_view).format = (*context_ptr).pix_fmt as i32;
+            (*frame_ptr_view).width = (*context_ptr).width;
+            (*frame_ptr_view).height = (*context_ptr).height;
+        }
 
         let width = round_size_up(unsafe { (*context_ptr).width } as usize);
         let height = round_size_up(unsafe { (*context_ptr).height } as usize);
@@ -126,6 +133,7 @@ impl EncoderBuilder {
         let has_ssse3 = { cpuid_ssse3::init().get() };
         debug!("Encoder {}x{}", width, height);
 
+
         // Image size * 3 / 2 because img may have bigger lane
         Ok(EncoderFFmpeg {
             context: self.context,
@@ -136,6 +144,7 @@ impl EncoderBuilder {
             has_ssse3,
             packet: AVPacket::new()?,
             frame,
+            frame_view,
             image_y: vec![0; image_size_y],
             image_u: vec![0; image_size_y],
             image_v: vec![0; image_size_y],
@@ -159,6 +168,7 @@ pub struct EncoderFFmpeg {
     has_ssse3: bool,
     packet: AVPacket,
     frame: AVFrame,
+    frame_view: AVFrame,
     /// Y yuv image part
     image_y: Vec<u8>,
     /// U yuv image part
@@ -225,6 +235,8 @@ impl Encoder for EncoderFFmpeg {
         let time_start = Instant::now();
 
         let pixel_format = unsafe { (*self.frame.ptr).format };
+
+        let mut use_frame_view = false;
 
         match pixel_format {
             x if x == AVPixelFormat::AV_PIX_FMT_YUV420P as i32 => {
@@ -444,49 +456,27 @@ impl Encoder for EncoderFFmpeg {
             }
             x if x == AVPixelFormat::AV_PIX_FMT_RGB0 as i32 => {
                 // rgb0
-                let image_bpl = bytes_per_line as usize;
-                let height = height as usize;
-
-                let plane_bpl = unsafe { (*self.frame.ptr).linesize[0] } as usize;
-                let size = plane_bpl * height;
-                self.frame
-                    .make_writable()
-                    .context("Error in make_writable")?;
-                let plane = self.frame.plane(0, size);
-
-                match (plane_bpl).cmp(&image_bpl) {
-                    Ordering::Equal => {
-                        self.frame.plane(0, size).copy_from_slice(&image[0..size]);
-                    }
-                    Ordering::Less => {
-                        for index in 0..height {
-                            plane[plane_bpl * index..plane_bpl * (index + 1)].copy_from_slice(
-                                &image[image_bpl * index..image_bpl * index + plane_bpl],
-                            );
-                        }
-                    }
-                    Ordering::Greater => {
-                        for index in 0..height as usize {
-                            plane[plane_bpl * index..plane_bpl * index + image_bpl]
-                                .copy_from_slice(
-                                    &image[image_bpl * index..image_bpl * index + image_bpl],
-                                );
-                        }
-                    }
+                self.frame_view.rgb0_from_slice(image, bytes_per_line as i32);
+                let frame_ptr_view = self.frame_view.as_mut_ptr();
+                unsafe {
+                    (*frame_ptr_view).width = width as i32;
+                    (*frame_ptr_view).height = height as i32;
                 }
+                use_frame_view = true;
             }
             _ => {
                 return Err(anyhow!("Unsupported pixel format {}", pixel_format));
             }
         };
 
+        let frame_input = if use_frame_view { &mut self.frame_view } else { &mut self.frame };
         unsafe {
-            (*self.frame.as_mut_ptr()).pts = count;
+            (*frame_input.as_mut_ptr()).pts = count;
         }
         let time_yuv = Instant::now();
 
         let mut retval = unsafe {
-            ffmpeg::avcodec_send_frame(self.context.as_mut_ptr(), self.frame.as_mut_ptr())
+            ffmpeg::avcodec_send_frame(self.context.as_mut_ptr(), frame_input.as_mut_ptr())
         };
         if retval < 0 {
             return Err(averror("avcodec_send_frame", retval));
